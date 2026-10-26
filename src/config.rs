@@ -28,7 +28,7 @@ pub struct ZellijState {
     pub focused_pane_cwd: Option<std::path::PathBuf>,
 }
 
-#[derive(Clone, Debug, Ord, Eq, PartialEq, PartialOrd, Copy)]
+#[derive(Clone, Debug, Ord, Eq, Hash, PartialEq, PartialOrd, Copy)]
 pub enum Part {
     Left,
     Center,
@@ -222,6 +222,9 @@ impl ModuleConfig {
             false => (output_left, output_center, output_right),
         };
 
+        let (output_left, output_center, output_right) =
+            self.fit_output(&output_left, &output_center, &output_right, state.cols);
+
         let mut offset = console::measure_text_width(&output_left);
 
         self.process_widget_click(click_pos, &self.left_parts, &widget_map, &state, 0);
@@ -371,6 +374,9 @@ impl ModuleConfig {
             false => (output_left, output_center, output_right),
         };
 
+        let (output_left, output_center, output_right) =
+            self.fit_output(&output_left, &output_center, &output_right, state.cols);
+
         if self.border.enabled {
             let mut border_top = "".to_owned();
             if self.border.enabled && self.border.position == BorderPosition::Top {
@@ -472,6 +478,53 @@ impl ModuleConfig {
         output.values().cloned().collect_tuple().unwrap()
     }
 
+    /// Truncates the parts until the bar fits into `cols`. Zellij wraps a
+    /// line that is too long and a one-row pane then shows only its last
+    /// row, so an overlong bar would otherwise be cut off on the left.
+    ///
+    /// The columns are handed out in `format_precedence` order. The first
+    /// part that does not fit is cut at its end and marked with an ellipsis;
+    /// every part after it is cut down to whatever is left.
+    fn fit_output(
+        &self,
+        output_left: &str,
+        output_center: &str,
+        output_right: &str,
+        cols: usize,
+    ) -> (String, String, String) {
+        let mut output = BTreeMap::from([
+            (Part::Left, output_left.to_owned()),
+            (Part::Center, output_center.to_owned()),
+            (Part::Right, output_right.to_owned()),
+        ]);
+
+        // zellij sometimes reports a col count of 0 on tab creation
+        if cols == 0 {
+            return output.into_values().collect_tuple().unwrap();
+        }
+
+        // parts missing from format_precedence go last, so they are cut first
+        let order = self
+            .format_precedence
+            .iter()
+            .copied()
+            .chain([Part::Left, Part::Center, Part::Right])
+            .unique();
+
+        let mut remaining = cols;
+        for part in order {
+            let text = output.get_mut(&part).unwrap();
+
+            if console::measure_text_width(text) > remaining {
+                *text = truncate_output(text, remaining);
+            }
+
+            remaining = remaining.saturating_sub(console::measure_text_width(text));
+        }
+
+        output.into_values().collect_tuple().unwrap()
+    }
+
     #[tracing::instrument(skip_all)]
     fn get_spacer_left(
         &self,
@@ -535,6 +588,17 @@ impl ModuleConfig {
     }
 }
 
+/// Cuts `text` to `width` columns, ending in an ellipsis that keeps the style
+/// of the text it replaces. Escape sequences past the cut are kept, and a
+/// reset follows, so no style leaks into the next part.
+fn truncate_output(text: &str, width: usize) -> String {
+    if width == 0 {
+        return "".to_owned();
+    }
+
+    format!("{}\x1b[0m", console::truncate_str(text, width, "…"))
+}
+
 fn parts_from_config(
     format: Option<&String>,
     config: &BTreeMap<String, String>,
@@ -573,5 +637,81 @@ mod test {
                 ..Default::default()
             },
         )
+    }
+
+    fn fit(
+        precedence: &str,
+        left: &str,
+        center: &str,
+        right: &str,
+        cols: usize,
+    ) -> (String, String, String) {
+        let config = BTreeMap::from([("format_precedence".to_owned(), precedence.to_owned())]);
+
+        ModuleConfig::new(&config)
+            .unwrap()
+            .fit_output(left, center, right, cols)
+    }
+
+    fn width(output: &(String, String, String)) -> usize {
+        console::measure_text_width(&output.0)
+            + console::measure_text_width(&output.1)
+            + console::measure_text_width(&output.2)
+    }
+
+    #[test]
+    fn test_fit_output_leaves_fitting_bar_alone() {
+        let output = fit("lcr", "left", "center", "right", 20);
+
+        assert_eq!(
+            output,
+            ("left".to_owned(), "center".to_owned(), "right".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_fit_output_cuts_lowest_precedence_part() {
+        let output = fit("rlc", "\x1b[31mtab one\x1b[0m tab two", "", "normal", 12);
+
+        assert_eq!(output.2, "normal");
+        assert_eq!(console::strip_ansi_codes(&output.0), "tab o…");
+        assert!(output.0.ends_with("\x1b[0m"));
+        assert_eq!(width(&output), 12);
+    }
+
+    #[test]
+    fn test_fit_output_follows_default_precedence() {
+        let output = fit("lcr", "tab one tab two", "", "normal", 18);
+
+        assert_eq!(output.0, "tab one tab two");
+        assert_eq!(console::strip_ansi_codes(&output.2), "no…");
+        assert_eq!(width(&output), 18);
+    }
+
+    #[test]
+    fn test_fit_output_empties_parts_without_room() {
+        let output = fit("rlc", "tabs", "center", "a very long right part", 10);
+
+        assert_eq!(console::strip_ansi_codes(&output.2), "a very lo…");
+        assert_eq!(output.0, "");
+        assert_eq!(output.1, "");
+    }
+
+    #[test]
+    fn test_fit_output_cuts_parts_missing_from_precedence_first() {
+        let output = fit("r", "tabs", "", "normal", 8);
+
+        assert_eq!(output.2, "normal");
+        assert_eq!(console::strip_ansi_codes(&output.0), "t…");
+    }
+
+    #[test]
+    fn test_fit_output_ignores_zero_cols() {
+        let output = fit("rlc", "left", "", "right", 0);
+
+        assert_eq!(
+            output,
+            ("left".to_owned(), "".to_owned(), "right".to_owned())
+        );
     }
 }
