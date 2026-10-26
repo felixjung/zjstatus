@@ -394,7 +394,7 @@ fn is_zellij_color_name(name: &str) -> bool {
 }
 
 #[cached(
-    ty = "LruCache<String, Option<ColorSource>>",
+    ty = "LruCache<String, ColorSource>",
     create = "{ LruCache::builder().max_size(100).build().unwrap() }",
     convert = r#"{ (color.to_owned()) }"#
 )]
